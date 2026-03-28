@@ -108,6 +108,9 @@
         "ssh:identitiesonly": {
           "type": "boolean"
         },
+        "ssh:proxycommand": {
+          "type": "string"
+        },
         "ssh:proxyjump": {
           "items": {
             "type": "string"

@@ -11,7 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -117,6 +117,76 @@ type ConnectionDebugInfo struct {
 type ConnectionError struct {
 	*ConnectionDebugInfo
 	Err error
+}
+
+type ProxyCommandAddr string
+
+func (a ProxyCommandAddr) Network() string {
+	return "proxycommand"
+}
+
+func (a ProxyCommandAddr) String() string {
+	return string(a)
+}
+
+type ProxyCommandConn struct {
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
+	stderr      *bytes.Buffer
+	networkAddr string
+	closeOnce   sync.Once
+}
+
+func (conn *ProxyCommandConn) Read(b []byte) (int, error) {
+	return conn.stdout.Read(b)
+}
+
+func (conn *ProxyCommandConn) Write(b []byte) (int, error) {
+	return conn.stdin.Write(b)
+}
+
+func (conn *ProxyCommandConn) Close() error {
+	var closeErr error
+	conn.closeOnce.Do(func() {
+		if conn.stdin != nil {
+			_ = conn.stdin.Close()
+		}
+		if conn.stdout != nil {
+			_ = conn.stdout.Close()
+		}
+		waitErr := conn.cmd.Wait()
+		if waitErr == nil || errors.Is(waitErr, os.ErrProcessDone) {
+			return
+		}
+		stderrText := strings.TrimSpace(conn.stderr.String())
+		if stderrText != "" {
+			closeErr = fmt.Errorf("%w: %s", waitErr, stderrText)
+			return
+		}
+		closeErr = waitErr
+	})
+	return closeErr
+}
+
+func (conn *ProxyCommandConn) LocalAddr() net.Addr {
+	return ProxyCommandAddr("local-proxycommand")
+}
+
+func (conn *ProxyCommandConn) RemoteAddr() net.Addr {
+	return ProxyCommandAddr(conn.networkAddr)
+}
+
+func (conn *ProxyCommandConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (conn *ProxyCommandConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (conn *ProxyCommandConn) SetWriteDeadline(t time.Time) error {
+	return nil
 }
 
 func (ce ConnectionError) Error() string {
@@ -838,17 +908,101 @@ func createClientConfig(connCtx context.Context, sshKeywords *wconfig.ConnKeywor
 	}, nil
 }
 
-func connectInternal(ctx context.Context, networkAddr string, clientConfig *ssh.ClientConfig, currentClient *ssh.Client) (*ssh.Client, error) {
+func expandProxyCommand(proxyCommandRaw string, sshKeywords *wconfig.ConnKeywords, networkAddr string) string {
+	hostName, port, err := net.SplitHostPort(networkAddr)
+	if err != nil {
+		hostName = utilfn.SafeDeref(sshKeywords.SshHostName)
+		port = utilfn.SafeDeref(sshKeywords.SshPort)
+	}
+	remoteUser := utilfn.SafeDeref(sshKeywords.SshUser)
+	var b strings.Builder
+	b.Grow(len(proxyCommandRaw) + len(hostName) + len(port) + len(remoteUser))
+	for i := 0; i < len(proxyCommandRaw); i++ {
+		if proxyCommandRaw[i] != '%' {
+			b.WriteByte(proxyCommandRaw[i])
+			continue
+		}
+		if i+1 >= len(proxyCommandRaw) {
+			b.WriteByte('%')
+			continue
+		}
+		i += 1
+		switch proxyCommandRaw[i] {
+		case '%':
+			b.WriteByte('%')
+		case 'h':
+			b.WriteString(hostName)
+		case 'p':
+			b.WriteString(port)
+		case 'r':
+			b.WriteString(remoteUser)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(proxyCommandRaw[i])
+		}
+	}
+	return b.String()
+}
+
+func createProxyCommandConn(ctx context.Context, networkAddr string, sshKeywords *wconfig.ConnKeywords) (net.Conn, error) {
+	proxyCommandRaw := strings.TrimSpace(utilfn.SafeDeref(sshKeywords.SshProxyCommand))
+	if proxyCommandRaw == "" || strings.EqualFold(proxyCommandRaw, "none") {
+		return nil, fmt.Errorf("proxy command is empty")
+	}
+	proxyCommand := expandProxyCommand(proxyCommandRaw, sshKeywords, networkAddr)
+	shellPath := shellutil.DetectLocalShellPath()
+	cmd := exec.Command(shellPath, "-c", proxyCommand)
+	stderrBuf := &bytes.Buffer{}
+	cmd.Stderr = stderrBuf
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return nil, err
+	}
+	err = cmd.Start()
+	if err != nil {
+		stdin.Close()
+		stdout.Close()
+		stderrText := strings.TrimSpace(stderrBuf.String())
+		if stderrText != "" {
+			return nil, fmt.Errorf("start proxy command: %w: %s", err, stderrText)
+		}
+		return nil, fmt.Errorf("start proxy command: %w", err)
+	}
+	return &ProxyCommandConn{
+		cmd:         cmd,
+		stdin:       stdin,
+		stdout:      stdout,
+		stderr:      stderrBuf,
+		networkAddr: networkAddr,
+	}, nil
+}
+
+func connectInternal(ctx context.Context, networkAddr string, clientConfig *ssh.ClientConfig, currentClient *ssh.Client, sshKeywords *wconfig.ConnKeywords) (*ssh.Client, error) {
 	var clientConn net.Conn
 	var err error
+	proxyCommand := strings.TrimSpace(utilfn.SafeDeref(sshKeywords.SshProxyCommand))
 	if currentClient == nil {
-		d := net.Dialer{Timeout: clientConfig.Timeout}
-		blocklogger.Infof(ctx, "[conndebug] ssh dial %s\n", networkAddr)
-		clientConn, err = d.DialContext(ctx, "tcp", networkAddr)
-		if err != nil {
-			subCode := ClassifyDialErrorSubCode(err)
-			blocklogger.Infof(ctx, "[conndebug] ERROR dial error [%s]: %v\n", subCode, err)
-			return nil, utilds.MakeSubCodedError(ConnErrCode_Dial, subCode, err)
+		if proxyCommand != "" && !strings.EqualFold(proxyCommand, "none") {
+			clientConn, err = createProxyCommandConn(ctx, networkAddr, sshKeywords)
+			if err != nil {
+				subCode := ClassifyDialErrorSubCode(err)
+				blocklogger.Infof(ctx, "[conndebug] ERROR proxy command dial error [%s]: %v", subCode, err)
+				return nil, utilds.MakeSubCodedError(ConnErrCode_Dial, subCode, err)
+			}
+		} else {
+			d := net.Dialer{Timeout: clientConfig.Timeout}
+			blocklogger.Infof(ctx, "[conndebug] ssh dial %s\n", networkAddr)
+			clientConn, err = d.DialContext(ctx, "tcp", networkAddr)
+			if err != nil {
+				subCode := ClassifyDialErrorSubCode(err)
+				blocklogger.Infof(ctx, "[conndebug] ERROR dial error [%s]: %v\n", subCode, err)
+				return nil, utilds.MakeSubCodedError(ConnErrCode_Dial, subCode, err)
+			}
 		}
 	} else {
 		blocklogger.Infof(ctx, "[conndebug] ssh dial (from client) %s\n", networkAddr)
@@ -926,6 +1080,7 @@ func ConnectToClient(connCtx context.Context, opts *SSHOpts, currentClient *ssh.
 	sshKeywords.SshIdentityFile = append(sshKeywords.SshIdentityFile, connFlags.SshIdentityFile...)
 	sshKeywords.SshIdentityFile = append(sshKeywords.SshIdentityFile, internalSshConfigKeywords.SshIdentityFile...)
 	sshKeywords.SshIdentityFile = append(sshKeywords.SshIdentityFile, sshConfigKeywords.SshIdentityFile...)
+	blocklogger.Infof(connCtx, "[conndebug] effective proxy settings command=%q jump=%v\n", utilfn.SafeDeref(sshKeywords.SshProxyCommand), sshKeywords.SshProxyJump)
 
 	for _, proxyName := range sshKeywords.SshProxyJump {
 		proxyOpts, err := ParseOpts(proxyName)
@@ -951,7 +1106,7 @@ func ConnectToClient(connCtx context.Context, opts *SSHOpts, currentClient *ssh.
 		return nil, debugInfo.JumpNum, ConnectionError{ConnectionDebugInfo: debugInfo, Err: err}
 	}
 	networkAddr := utilfn.SafeDeref(sshKeywords.SshHostName) + ":" + utilfn.SafeDeref(sshKeywords.SshPort)
-	client, err := connectInternal(connCtx, networkAddr, clientConfig, debugInfo.CurrentClient)
+	client, err := connectInternal(connCtx, networkAddr, clientConfig, debugInfo.CurrentClient, sshKeywords)
 	if err != nil {
 		return client, debugInfo.JumpNum, ConnectionError{ConnectionDebugInfo: debugInfo, Err: err}
 	}
@@ -1088,6 +1243,15 @@ func findSshConfigKeywords(hostPattern string) (connKeywords *wconfig.ConnKeywor
 		sshKeywords.SshIdentityAgent = utilfn.Ptr(agentPath)
 	}
 
+	proxyCommandRaw, err := WaveSshConfigUserSettings().GetStrict(hostPattern, "ProxyCommand")
+	if err != nil {
+		return nil, err
+	}
+	proxyCommandRaw = trimquotes.TryTrimQuotes(proxyCommandRaw)
+	if proxyCommandRaw != "" && strings.ToLower(proxyCommandRaw) != "none" {
+		sshKeywords.SshProxyCommand = utilfn.Ptr(proxyCommandRaw)
+	}
+
 	proxyJumpRaw, err := WaveSshConfigUserSettings().GetStrict(hostPattern, "ProxyJump")
 	if err != nil {
 		return nil, err
@@ -1127,6 +1291,10 @@ func findSshDefaults(hostPattern string) (connKeywords *wconfig.ConnKeywords, ou
 	sshKeywords.SshAddKeysToAgent = utilfn.Ptr(false)
 	sshKeywords.SshIdentitiesOnly = utilfn.Ptr(false)
 	sshKeywords.SshIdentityAgent = utilfn.Ptr(ssh_config.Default("IdentityAgent"))
+	proxyCommandRaw := trimquotes.TryTrimQuotes(ssh_config.Default("ProxyCommand"))
+	if proxyCommandRaw != "" && strings.ToLower(proxyCommandRaw) != "none" {
+		sshKeywords.SshProxyCommand = utilfn.Ptr(proxyCommandRaw)
+	}
 	sshKeywords.SshProxyJump = []string{}
 	sshKeywords.SshUserKnownHostsFile = strings.Fields(ssh_config.Default("UserKnownHostsFile"))
 	sshKeywords.SshGlobalKnownHostsFile = strings.Fields(ssh_config.Default("GlobalKnownHostsFile"))
@@ -1193,6 +1361,12 @@ func mergeKeywords(oldKeywords *wconfig.ConnKeywords, newKeywords *wconfig.ConnK
 	}
 	if newKeywords.SshIdentitiesOnly != nil {
 		outKeywords.SshIdentitiesOnly = newKeywords.SshIdentitiesOnly
+	}
+	if newKeywords.SshProxyCommand != nil {
+		proxyCommand := strings.TrimSpace(*newKeywords.SshProxyCommand)
+		if proxyCommand != "" {
+			outKeywords.SshProxyCommand = utilfn.Ptr(proxyCommand)
+		}
 	}
 	if newKeywords.SshProxyJump != nil {
 		outKeywords.SshProxyJump = newKeywords.SshProxyJump
