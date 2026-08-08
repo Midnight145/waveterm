@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	ProcCacheIdleTimeout  = 10 * time.Second
+	ProcCacheIdleTimeout  = 60 * time.Second
 	ProcCachePollInterval = 1 * time.Second
+	ProcCacheMinSleep     = 500 * time.Millisecond
 	ProcViewerMaxLimit    = 500
 )
 
@@ -35,6 +36,13 @@ type cpuSample struct {
 	CPUSec    float64   // user+system cpu seconds at sample time
 	SampledAt time.Time // when the sample was taken
 	Epoch     int       // epoch at which this sample was recorded
+}
+
+// widgetPidOrder stores the ordered pid list from the last non-LastPidOrder request for a widget.
+type widgetPidOrder struct {
+	pids        []int32
+	totalCount  int
+	lastRequest time.Time
 }
 
 // procCacheState is the singleton background cache for process list data.
@@ -50,6 +58,8 @@ type procCacheState struct {
 	lastCPUSamples map[int32]cpuSample
 	lastCPUEpoch   int
 	uidCache       map[uint32]string // uid -> username, populated lazily
+
+	widgetPidOrders map[string]*widgetPidOrder // keyed by widgetId
 }
 
 // procCache is the singleton background cache for process list data.
@@ -88,17 +98,104 @@ func (s *procCacheState) requestAndWait(ctx context.Context) (*wshrpc.ProcessLis
 	return result, nil
 }
 
+func (s *procCacheState) touchLastRequest() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.lastRequest = time.Now()
+}
+
+func (s *procCacheState) touchWidgetPidOrder(widgetId string) {
+	if widgetId == "" {
+		return
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.lastRequest = time.Now()
+	if s.widgetPidOrders != nil {
+		if entry, ok := s.widgetPidOrders[widgetId]; ok {
+			entry.lastRequest = time.Now()
+		}
+	}
+}
+
+func (s *procCacheState) storeWidgetPidOrder(widgetId string, pids []int32, totalCount int) {
+	if widgetId == "" {
+		return
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.widgetPidOrders == nil {
+		s.widgetPidOrders = make(map[string]*widgetPidOrder)
+	}
+	s.widgetPidOrders[widgetId] = &widgetPidOrder{
+		pids:        pids,
+		totalCount:  totalCount,
+		lastRequest: time.Now(),
+	}
+}
+
+func (s *procCacheState) getWidgetPidOrder(widgetId string) ([]int32, int) {
+	if widgetId == "" {
+		return nil, 0
+	}
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.widgetPidOrders == nil {
+		return nil, 0
+	}
+	entry, ok := s.widgetPidOrders[widgetId]
+	if !ok {
+		return nil, 0
+	}
+	if time.Since(entry.lastRequest) >= ProcCacheIdleTimeout {
+		delete(s.widgetPidOrders, widgetId)
+		return nil, 0
+	}
+	return entry.pids, entry.totalCount
+}
+
+// updateCacheAndCheckIdle stores the latest snapshot, signals the first-ready channel if needed,
+// and checks whether the loop has been idle long enough to shut down.
+// Returns true if the loop should exit (idle timeout reached), false to continue.
+func (s *procCacheState) updateCacheAndCheckIdle(result *wshrpc.ProcessListResponse, firstDone *bool, firstReadyCh chan struct{}) bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if result != nil {
+		s.cached = result
+	}
+	if !*firstDone {
+		*firstDone = true
+		close(firstReadyCh)
+		s.ready = nil
+	}
+	if time.Since(s.lastRequest) < ProcCacheIdleTimeout {
+		return false
+	}
+	s.cached = nil
+	s.running = false
+	s.lastCPUSamples = nil
+	s.lastCPUEpoch = 0
+	s.uidCache = nil
+	s.widgetPidOrders = nil
+	return true
+}
+
 func (s *procCacheState) runLoop(firstReadyCh chan struct{}) {
+	firstDone := false
 	defer func() {
-		panichandler.PanicHandler("procCache.runLoop", recover())
+		if panichandler.PanicHandler("procCache.runLoop", recover()) == nil {
+			return
+		}
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		s.running = false
+		if !firstDone {
+			close(firstReadyCh)
+			s.ready = nil
+		}
 	}()
 
-	numCPU := runtime.NumCPU()
-	if numCPU < 1 {
-		numCPU = 1
-	}
-
-	firstDone := false
+	numCPU := max(runtime.NumCPU(), 1)
 
 	for {
 		iterStart := time.Now()
@@ -113,35 +210,21 @@ func (s *procCacheState) runLoop(firstReadyCh chan struct{}) {
 			}
 		}
 
-		s.lock.Lock()
-		s.cached = result
-		idleFor := time.Since(s.lastRequest)
-		if !firstDone {
-			firstDone = true
-			close(firstReadyCh)
-			s.ready = nil
-		}
-		if idleFor >= ProcCacheIdleTimeout {
-			s.cached = nil
-			s.running = false
-			s.lastCPUSamples = nil
-			s.lastCPUEpoch = 0
-			s.uidCache = nil
-			s.lock.Unlock()
+		if s.updateCacheAndCheckIdle(result, &firstDone, firstReadyCh) {
 			return
 		}
-		s.lock.Unlock()
 
 		elapsed := time.Since(iterStart)
-		if sleep := ProcCachePollInterval - elapsed; sleep > 0 {
-			time.Sleep(sleep)
-		}
+		time.Sleep(max(ProcCacheMinSleep, ProcCachePollInterval-elapsed))
 	}
 }
 
 // lookupUID resolves a uid to a username, using the per-run cache to avoid
 // repeated syscalls for the same uid.
 func (s *procCacheState) lookupUID(uid uint32) string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
 	if s.uidCache == nil {
 		s.uidCache = make(map[uint32]string)
 	}
@@ -173,39 +256,34 @@ func (s *procCacheState) collectSnapshot(numCPU int) *wshrpc.ProcessListResponse
 		s.lastCPUSamples = make(map[int32]cpuSample, len(procs))
 	}
 
-	snap, _ := procinfo.MakeGlobalSnapshot()
+	snap, err := procinfo.MakeGlobalSnapshot()
+	if err != nil {
+		return nil
+	}
 
 	hasCPU := s.lastCPUEpoch > 1 // first epoch has no previous sample to diff against
 
-	// Build per-pid procinfo in parallel, then compute CPU% sequentially.
 	type pidInfo struct {
 		pid  int32
 		info *procinfo.ProcInfo
 	}
 	rawInfos := make([]pidInfo, len(procs))
-	var wg sync.WaitGroup
 	for i, p := range procs {
-		i, p := i, p
-		wg.Add(1)
-		go func() {
-			defer func() {
-				panichandler.PanicHandler("collectSnapshot:GetProcInfo", recover())
-				wg.Done()
-			}()
-			pi, err := procinfo.GetProcInfo(ctx, snap, p.Pid)
-			if err != nil {
-				pi = nil
-			}
-			rawInfos[i] = pidInfo{pid: p.Pid, info: pi}
-		}()
+		pi, err := procinfo.GetProcInfo(ctx, snap, p.Pid)
+		if err != nil {
+			pi = nil
+		}
+		rawInfos[i] = pidInfo{pid: p.Pid, info: pi}
 	}
-	wg.Wait()
 
 	// Sample CPU times and compute CPU% sequentially to keep epoch accounting simple.
 	cpuPcts := make(map[int32]float64, len(procs))
 	sampleTime := time.Now()
 	for _, ri := range rawInfos {
 		if ri.info == nil {
+			continue
+		}
+		if ri.info.CpuUser < 0 || ri.info.CpuSys < 0 {
 			continue
 		}
 		curCPUSec := ri.info.CpuUser + ri.info.CpuSys
@@ -226,10 +304,11 @@ func (s *procCacheState) collectSnapshot(numCPU int) *wshrpc.ProcessListResponse
 		}
 	}
 
-	// Compute total memory for MemPct.
+	// Compute total memory for MemPct and summary.
+	vmStat, _ := mem.VirtualMemoryWithContext(ctx)
 	var totalMem uint64
-	if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil {
-		totalMem = vm.Total
+	if vmStat != nil {
+		totalMem = vmStat.Total
 	}
 
 	var cpuSum float64
@@ -245,32 +324,24 @@ func (s *procCacheState) collectSnapshot(numCPU int) *wshrpc.ProcessListResponse
 			Command:    pi.Command,
 			Status:     pi.Status,
 			Mem:        pi.VmRSS,
+			MemPct:     -1,
+			Cpu:        -1,
 			NumThreads: pi.NumThreads,
 			User:       s.lookupUID(pi.Uid),
 		}
-		if totalMem > 0 {
+		if totalMem > 0 && pi.VmRSS >= 0 {
 			info.MemPct = float64(pi.VmRSS) / float64(totalMem) * 100
 		}
 		if hasCPU {
 			if cpu, ok := cpuPcts[pi.Pid]; ok {
-				v := cpu
-				info.Cpu = &v
+				info.Cpu = cpu
 				cpuSum += cpu
 			}
 		}
 		infos = append(infos, info)
 	}
 
-	summaryCh := make(chan wshrpc.ProcessSummary, 1)
-	go func() {
-		defer func() {
-			if err := panichandler.PanicHandler("buildProcessSummary", recover()); err != nil {
-				summaryCh <- wshrpc.ProcessSummary{Total: len(procs)}
-			}
-		}()
-		summaryCh <- buildProcessSummary(ctx, len(procs), numCPU, cpuSum)
-	}()
-	summary := <-summaryCh
+	summary := buildProcessSummary(ctx, len(procs), numCPU, cpuSum, vmStat)
 
 	return &wshrpc.ProcessListResponse{
 		Processes: infos,
@@ -281,6 +352,10 @@ func (s *procCacheState) collectSnapshot(numCPU int) *wshrpc.ProcessListResponse
 	}
 }
 
+func bound(v, lo, hi int) int {
+	return max(lo, min(v, hi))
+}
+
 func computeCPUPct(t1, t2, elapsedSec float64) float64 {
 	delta := (t2 - t1) / elapsedSec * 100
 	if delta < 0 {
@@ -289,17 +364,17 @@ func computeCPUPct(t1, t2, elapsedSec float64) float64 {
 	return delta
 }
 
-func buildProcessSummary(ctx context.Context, total int, numCPU int, cpuSum float64) wshrpc.ProcessSummary {
+func buildProcessSummary(ctx context.Context, total int, numCPU int, cpuSum float64, vmStat *mem.VirtualMemoryStat) wshrpc.ProcessSummary {
 	summary := wshrpc.ProcessSummary{Total: total, NumCPU: numCPU, CpuSum: cpuSum}
 	if avg, err := load.AvgWithContext(ctx); err == nil {
 		summary.Load1 = avg.Load1
 		summary.Load5 = avg.Load5
 		summary.Load15 = avg.Load15
 	}
-	if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil {
-		summary.MemTotal = vm.Total
-		summary.MemUsed = vm.Used
-		summary.MemFree = vm.Free
+	if vmStat != nil {
+		summary.MemTotal = vmStat.Total
+		summary.MemUsed = vmStat.Used
+		summary.MemFree = vmStat.Free
 	}
 	return summary
 }
@@ -322,56 +397,88 @@ func filterProcesses(processes []wshrpc.ProcessInfo, textSearch string) []wshrpc
 	return filtered
 }
 
-func sortAndLimitProcesses(processes []wshrpc.ProcessInfo, sortBy string, sortDesc bool, start int, limit int) []wshrpc.ProcessInfo {
+func sortProcesses(processes []wshrpc.ProcessInfo, sortBy string, sortDesc bool) {
 	switch sortBy {
 	case "cpu":
 		sort.Slice(processes, func(i, j int) bool {
-			ci, cj := 0.0, 0.0
-			if processes[i].Cpu != nil {
-				ci = *processes[i].Cpu
+			ci := processes[i].Cpu
+			cj := processes[j].Cpu
+			iNull := ci < 0
+			jNull := cj < 0
+			if iNull != jNull {
+				return !iNull
 			}
-			if processes[j].Cpu != nil {
-				cj = *processes[j].Cpu
+			if !iNull && ci != cj {
+				if sortDesc {
+					return ci > cj
+				}
+				return ci < cj
 			}
-			if sortDesc {
-				return ci > cj
-			}
-			return ci < cj
+			return processes[i].Pid < processes[j].Pid
 		})
 	case "mem":
 		sort.Slice(processes, func(i, j int) bool {
-			if sortDesc {
-				return processes[i].Mem > processes[j].Mem
+			mi := processes[i].Mem
+			mj := processes[j].Mem
+			iNull := mi < 0
+			jNull := mj < 0
+			if iNull != jNull {
+				return !iNull
 			}
-			return processes[i].Mem < processes[j].Mem
+			if !iNull && mi != mj {
+				if sortDesc {
+					return mi > mj
+				}
+				return mi < mj
+			}
+			return processes[i].Pid < processes[j].Pid
 		})
 	case "command":
 		sort.Slice(processes, func(i, j int) bool {
-			if sortDesc {
-				return processes[i].Command > processes[j].Command
+			if processes[i].Command != processes[j].Command {
+				if sortDesc {
+					return processes[i].Command > processes[j].Command
+				}
+				return processes[i].Command < processes[j].Command
 			}
-			return processes[i].Command < processes[j].Command
+			return processes[i].Pid < processes[j].Pid
 		})
 	case "user":
 		sort.Slice(processes, func(i, j int) bool {
-			if sortDesc {
-				return processes[i].User > processes[j].User
+			if processes[i].User != processes[j].User {
+				if sortDesc {
+					return processes[i].User > processes[j].User
+				}
+				return processes[i].User < processes[j].User
 			}
-			return processes[i].User < processes[j].User
+			return processes[i].Pid < processes[j].Pid
 		})
 	case "status":
 		sort.Slice(processes, func(i, j int) bool {
-			if sortDesc {
-				return processes[i].Status > processes[j].Status
+			if processes[i].Status != processes[j].Status {
+				if sortDesc {
+					return processes[i].Status > processes[j].Status
+				}
+				return processes[i].Status < processes[j].Status
 			}
-			return processes[i].Status < processes[j].Status
+			return processes[i].Pid < processes[j].Pid
 		})
 	case "threads":
 		sort.Slice(processes, func(i, j int) bool {
-			if sortDesc {
-				return processes[i].NumThreads > processes[j].NumThreads
+			ti := processes[i].NumThreads
+			tj := processes[j].NumThreads
+			iNull := ti < 0
+			jNull := tj < 0
+			if iNull != jNull {
+				return !iNull
 			}
-			return processes[i].NumThreads < processes[j].NumThreads
+			if !iNull && ti != tj {
+				if sortDesc {
+					return ti > tj
+				}
+				return ti < tj
+			}
+			return processes[i].Pid < processes[j].Pid
 		})
 	default: // "pid"
 		sort.Slice(processes, func(i, j int) bool {
@@ -381,63 +488,80 @@ func sortAndLimitProcesses(processes []wshrpc.ProcessInfo, sortBy string, sortDe
 			return processes[i].Pid < processes[j].Pid
 		})
 	}
-	if start > 0 {
-		if start >= len(processes) {
-			return nil
-		}
-		processes = processes[start:]
-	}
-	if limit > 0 && len(processes) > limit {
-		processes = processes[:limit]
-	}
-	return processes
 }
 
 func (impl *ServerImpl) RemoteProcessListCommand(ctx context.Context, data wshrpc.CommandRemoteProcessListData) (*wshrpc.ProcessListResponse, error) {
+	if data.KeepAlive {
+		if data.WidgetId != "" {
+			procCache.touchWidgetPidOrder(data.WidgetId)
+		} else {
+			procCache.touchLastRequest()
+		}
+		return nil, nil
+	}
+
 	raw, err := procCache.requestAndWait(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Pids overrides all other request fields; when set we skip sort/limit/start/textsearch
-	// and return only the exact pids requested.
-	if len(data.Pids) > 0 {
-		pidSet := make(map[int32]struct{}, len(data.Pids))
-		for _, pid := range data.Pids {
-			pidSet[pid] = struct{}{}
+	totalCount := len(raw.Processes)
+
+	// Phase 1: derive the pid order.
+	// Use cached order if LastPidOrder is set and a cached order exists; otherwise filter/sort and store.
+	var pidOrder []int32
+	var filteredCount int
+	if data.LastPidOrder {
+		var cachedTotal int
+		pidOrder, cachedTotal = procCache.getWidgetPidOrder(data.WidgetId)
+		if pidOrder != nil {
+			filteredCount = len(pidOrder)
+			totalCount = cachedTotal
 		}
-		processes := make([]wshrpc.ProcessInfo, 0, len(data.Pids))
-		for _, p := range raw.Processes {
-			if _, ok := pidSet[p.Pid]; ok {
-				processes = append(processes, p)
-			}
+	}
+	if pidOrder == nil {
+		sortBy := data.SortBy
+		sortDesc := data.SortDesc
+		if sortBy == "" {
+			sortBy = "cpu"
+			sortDesc = true
 		}
-		return &wshrpc.ProcessListResponse{
-			Processes: processes,
-			Summary:   raw.Summary,
-			Ts:        raw.Ts,
-			HasCPU:    raw.HasCPU,
-			Platform:  raw.Platform,
-		}, nil
+		procs := make([]wshrpc.ProcessInfo, len(raw.Processes))
+		copy(procs, raw.Processes)
+		procs = filterProcesses(procs, data.TextSearch)
+		filteredCount = len(procs)
+		sortProcesses(procs, sortBy, sortDesc)
+		pidOrder = make([]int32, len(procs))
+		for i, p := range procs {
+			pidOrder[i] = p.Pid
+		}
+		if data.WidgetId != "" {
+			procCache.storeWidgetPidOrder(data.WidgetId, pidOrder, totalCount)
+		}
 	}
 
-	sortBy := data.SortBy
-	if sortBy == "" {
-		sortBy = "cpu"
-	}
+	// Phase 2: limit and populate process info from the pid order.
 	limit := data.Limit
 	if limit <= 0 || limit > ProcViewerMaxLimit {
 		limit = ProcViewerMaxLimit
 	}
-
-	totalCount := len(raw.Processes)
-
-	// Copy processes so we can sort/limit without mutating the cache.
-	processes := make([]wshrpc.ProcessInfo, len(raw.Processes))
-	copy(processes, raw.Processes)
-	processes = filterProcesses(processes, data.TextSearch)
-	filteredCount := len(processes)
-	processes = sortAndLimitProcesses(processes, sortBy, data.SortDesc, data.Start, limit)
+	pidMap := make(map[int32]wshrpc.ProcessInfo, len(raw.Processes))
+	for _, p := range raw.Processes {
+		pidMap[p.Pid] = p
+	}
+	start := bound(data.Start, 0, len(pidOrder))
+	window := pidOrder[start:]
+	if limit > 0 && len(window) > limit {
+		window = window[:limit]
+	}
+	processes := make([]wshrpc.ProcessInfo, 0, len(window))
+	for _, pid := range window {
+		if p, ok := pidMap[pid]; ok {
+			processes = append(processes, p)
+		} else {
+			processes = append(processes, wshrpc.ProcessInfo{Pid: pid, Gone: true})
+		}
+	}
 
 	return &wshrpc.ProcessListResponse{
 		Processes:     processes,

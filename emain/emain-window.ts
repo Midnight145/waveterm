@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { ClientService, ObjectService, WindowService, WorkspaceService } from "@/app/store/services";
+import { waveEventSubscribeSingle } from "@/app/store/wps";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { fireAndForget } from "@/util/util";
-import { BaseWindow, BaseWindowConstructorOptions, dialog, globalShortcut, ipcMain, screen } from "electron";
+import { BaseWindow, BaseWindowConstructorOptions, dialog, globalShortcut, ipcMain, screen, webContents } from "electron";
 import { globalEvents } from "emain/emain-events";
 import path from "path";
 import { debounce } from "throttle-debounce";
@@ -100,6 +101,13 @@ export const waveWindowMap = new Map<string, WaveBrowserWindow>(); // waveWindow
 // on blur we do not set this to null (but on destroy we do), so this tracks the *last* focused window
 // e.g. it persists when the app itself is not focused
 export let focusedWaveWindow: WaveBrowserWindow = null;
+
+// quake window for toggle hotkey (show/hide behavior)
+let quakeWindow: WaveBrowserWindow | null = null;
+
+export function getQuakeWindow(): WaveBrowserWindow | null {
+    return quakeWindow;
+}
 
 let cachedClientId: string = null;
 let hasCompletedFirstRelaunch = false;
@@ -291,6 +299,7 @@ export class WaveBrowserWindow extends BaseWindow {
             if (this.isDestroyed()) {
                 return;
             }
+            this.closeAllDevTools();
             console.log("win 'close' handler fired", this.waveWindowId);
             if (getGlobalIsQuitting() || updater?.status == "installing" || getGlobalIsRelaunching()) {
                 return;
@@ -332,6 +341,9 @@ export class WaveBrowserWindow extends BaseWindow {
             if (focusedWaveWindow == this) {
                 focusedWaveWindow = null;
             }
+            if (quakeWindow == this) {
+                quakeWindow = null;
+            }
             this.removeAllChildViews();
             if (getGlobalIsRelaunching()) {
                 console.log("win relaunching", this.waveWindowId);
@@ -345,6 +357,24 @@ export class WaveBrowserWindow extends BaseWindow {
         });
         waveWindowMap.set(waveWindow.oid, this);
         setTimeout(() => globalEvents.emit("windows-updated"), 50);
+    }
+
+    private closeAllDevTools() {
+        for (const tabView of this.allLoadedTabViews.values()) {
+            if (tabView.webContents?.isDevToolsOpened()) {
+                tabView.webContents.closeDevTools();
+            }
+        }
+        const tabViewIds = new Set(
+            [...this.allLoadedTabViews.values()].map((tv) => tv.webContents?.id).filter((id) => id != null)
+        );
+        for (const wc of webContents.getAllWebContents()) {
+            if (wc.getType() === "webview" && tabViewIds.has(wc.hostWebContents?.id)) {
+                if (wc.isDevToolsOpened()) {
+                    wc.closeDevTools();
+                }
+            }
+        }
     }
 
     private removeAllChildViews() {
@@ -704,6 +734,7 @@ export async function createBrowserWindow(
     }
     console.log("createBrowserWindow", waveWindow.oid, workspace.oid, workspace);
     const bwin = new WaveBrowserWindow(waveWindow, fullConfig, opts);
+
     if (workspace.activetabid) {
         await bwin.setActiveTab(workspace.activetabid, false, opts.isPrimaryStartupWindow ?? false);
     }
@@ -832,6 +863,9 @@ export async function createNewWaveWindow() {
                 unamePlatform,
                 isPrimaryStartupWindow: false,
             });
+            if (quakeWindow == null) {
+                quakeWindow = win;
+            }
             win.show();
             recreatedWindow = true;
         }
@@ -845,6 +879,9 @@ export async function createNewWaveWindow() {
         unamePlatform,
         isPrimaryStartupWindow: false,
     });
+    if (quakeWindow == null) {
+        quakeWindow = newBrowserWindow;
+    }
     newBrowserWindow.show();
 }
 
@@ -887,6 +924,10 @@ export async function relaunchBrowserWindows() {
             foregroundWindow: windowId === primaryWindowId,
         });
         wins.push(win);
+        if (windowId === primaryWindowId) {
+            quakeWindow = win;
+            console.log("designated quake window", win.waveWindowId);
+        }
     }
     hasCompletedFirstRelaunch = true;
     for (const win of wins) {
@@ -895,22 +936,184 @@ export async function relaunchBrowserWindows() {
     }
 }
 
+function getDisplayForQuakeToggle() {
+    // We cannot reliably query the OS-wide active window in Electron.
+    // Cursor position is the best cross-platform proxy for the user's active display.
+    const cursorPoint = screen.getCursorScreenPoint();
+    const displayAtCursor = screen
+        .getAllDisplays()
+        .find(
+            (display) =>
+                cursorPoint.x >= display.bounds.x &&
+                cursorPoint.x < display.bounds.x + display.bounds.width &&
+                cursorPoint.y >= display.bounds.y &&
+                cursorPoint.y < display.bounds.y + display.bounds.height
+        );
+    return displayAtCursor ?? screen.getDisplayNearestPoint(cursorPoint);
+}
+
+function moveWindowToDisplay(win: WaveBrowserWindow, targetDisplay: Electron.Display) {
+    if (!win || !targetDisplay || win.isDestroyed()) {
+        return;
+    }
+    const curBounds = win.getBounds();
+    const sourceDisplay = screen.getDisplayMatching(curBounds);
+    if (sourceDisplay.id === targetDisplay.id) {
+        return;
+    }
+
+    const sourceArea = sourceDisplay.workArea;
+    const targetArea = targetDisplay.workArea;
+    const nextHeight = Math.min(curBounds.height, targetArea.height);
+    const nextWidth = Math.min(curBounds.width, targetArea.width);
+    const maxXOffset = Math.max(0, targetArea.width - nextWidth);
+    const maxYOffset = Math.max(0, targetArea.height - nextHeight);
+    const sourceXOffset = curBounds.x - sourceArea.x;
+    const sourceYOffset = curBounds.y - sourceArea.y;
+    const nextX = targetArea.x + Math.min(Math.max(sourceXOffset, 0), maxXOffset);
+    const nextY = targetArea.y + Math.min(Math.max(sourceYOffset, 0), maxYOffset);
+
+    win.setBounds({ ...curBounds, x: nextX, y: nextY, width: nextWidth, height: nextHeight });
+}
+
+const FullscreenTransitionTimeoutMs = 2000;
+
+// handles a theoretical race condition where the user spams the hotkey before the toggle finishes
+let quakeToggleInProgress = false;
+let quakeRestoreFullscreenOnShow = false;
+
+function waitForFullscreenLeave(window: WaveBrowserWindow): Promise<void> {
+    if (!window.isFullScreen()) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+        // eslint-disable-next-line prefer-const
+        let timeout: ReturnType<typeof setTimeout>;
+        const onLeave = () => {
+            clearTimeout(timeout);
+            resolve();
+        };
+        timeout = setTimeout(() => {
+            window.removeListener("leave-full-screen", onLeave);
+            reject(new Error("fullscreen transition timeout"));
+        }, FullscreenTransitionTimeoutMs);
+        window.once("leave-full-screen", onLeave);
+    });
+}
+
+function waitForFullscreenEnter(window: WaveBrowserWindow): Promise<void> {
+    if (window.isFullScreen()) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+        // eslint-disable-next-line prefer-const
+        let timeout: ReturnType<typeof setTimeout>;
+        const onEnter = () => {
+            clearTimeout(timeout);
+            resolve();
+        };
+        timeout = setTimeout(() => {
+            window.removeListener("enter-full-screen", onEnter);
+            reject(new Error("fullscreen transition timeout"));
+        }, FullscreenTransitionTimeoutMs);
+        window.once("enter-full-screen", onEnter);
+    });
+}
+
+async function quakeToggle() {
+    if (quakeToggleInProgress) {
+        return;
+    }
+    quakeToggleInProgress = true;
+    try {
+        let window = quakeWindow;
+        if (window?.isDestroyed()) {
+            quakeWindow = null;
+            window = null;
+        }
+        if (window == null) {
+            await createNewWaveWindow();
+            return;
+        }
+        // Some environments don't hide or move the window if it's fullscreen (even when hidden), so leave fullscreen first
+        if (window.isFullScreen()) {
+            // macos has a really long fullscreen animation and can have issues restoring from fullscreen, so we skip on macos
+            quakeRestoreFullscreenOnShow = process.platform !== "darwin";
+            const leavePromise = waitForFullscreenLeave(window);
+            window.setFullScreen(false);
+            try {
+                await leavePromise;
+            } catch {
+                // timeout — proceed anyway
+            }
+            if (window.isDestroyed()) {
+                return;
+            }
+        }
+        if (window.isVisible()) {
+            window.hide();
+        } else {
+            const targetDisplay = getDisplayForQuakeToggle();
+            moveWindowToDisplay(window, targetDisplay);
+            window.show();
+            if (quakeRestoreFullscreenOnShow) {
+                const enterPromise = waitForFullscreenEnter(window);
+                window.setFullScreen(true);
+                try {
+                    await enterPromise;
+                } catch {
+                    // timeout — proceed anyway
+                }
+            }
+            quakeRestoreFullscreenOnShow = false;
+            window.focus();
+            if (window.activeTabView?.webContents) {
+                window.activeTabView.webContents.focus();
+            }
+        }
+    } finally {
+        quakeToggleInProgress = false;
+    }
+}
+
+let currentRawGlobalHotKey: string = null;
+let currentGlobalHotKey: string = null;
+
 export function registerGlobalHotkey(rawGlobalHotKey: string) {
+    if (rawGlobalHotKey === currentRawGlobalHotKey) {
+        return;
+    }
+    if (currentGlobalHotKey != null) {
+        globalShortcut.unregister(currentGlobalHotKey);
+        currentGlobalHotKey = null;
+        currentRawGlobalHotKey = null;
+    }
+    if (!rawGlobalHotKey) {
+        return;
+    }
     try {
         const electronHotKey = waveKeyToElectronKey(rawGlobalHotKey);
-        console.log("registering globalhotkey of ", electronHotKey);
-        globalShortcut.register(electronHotKey, () => {
-            const selectedWindow = focusedWaveWindow;
-            const firstWaveWindow = getAllWaveWindows()[0];
-            if (focusedWaveWindow) {
-                selectedWindow.focus();
-            } else if (firstWaveWindow) {
-                firstWaveWindow.focus();
-            } else {
-                fireAndForget(createNewWaveWindow);
-            }
+        const ok = globalShortcut.register(electronHotKey, () => {
+            fireAndForget(quakeToggle);
         });
+        currentRawGlobalHotKey = rawGlobalHotKey;
+        currentGlobalHotKey = electronHotKey;
+        console.log("registered globalhotkey", rawGlobalHotKey, "=>", electronHotKey, "ok=", ok);
     } catch (e) {
-        console.log("error registering global hotkey: ", e);
+        console.log("error registering global hotkey", rawGlobalHotKey, ":", e);
     }
+}
+
+export function initGlobalHotkeyEventSubscription() {
+    waveEventSubscribeSingle({
+        eventType: "config",
+        handler: (event) => {
+            try {
+                const hotkey = event?.data?.fullconfig?.settings?.["app:globalhotkey"];
+                registerGlobalHotkey(hotkey ?? null);
+            } catch (e) {
+                console.log("error handling config event for globalhotkey", e);
+            }
+        },
+    });
 }

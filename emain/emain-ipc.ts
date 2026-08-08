@@ -236,6 +236,14 @@ export function initIpcHandlers() {
         menu.popup();
     });
 
+    electron.ipcMain.on("webview-mouse-navigate", (event: electron.IpcMainEvent, direction: string) => {
+        if (direction === "back") {
+            event.sender.navigationHistory.goBack();
+        } else if (direction === "forward") {
+            event.sender.navigationHistory.goForward();
+        }
+    });
+
     electron.ipcMain.on("download", (event, payload) => {
         const baseName = encodeURIComponent(path.basename(payload.filePath));
         const streamingUrl =
@@ -480,6 +488,17 @@ export function initIpcHandlers() {
                 });
             } catch (e) {
                 console.error("Error deleting builder rtinfo:", e);
+            }
+        }
+        const wc = bw.webContents;
+        if (wc.isDevToolsOpened()) {
+            wc.closeDevTools();
+        }
+        for (const guest of electron.webContents.getAllWebContents()) {
+            if (guest.getType() === "webview" && guest.hostWebContents?.id === wc.id) {
+                if (guest.isDevToolsOpened()) {
+                    guest.closeDevTools();
+                }
             }
         }
         bw.destroy();

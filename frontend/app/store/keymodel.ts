@@ -549,7 +549,12 @@ function registerGlobalKeys() {
         const layoutModel = getLayoutModelForStaticTab();
         const focusedNode = globalStore.get(layoutModel.focusedNode);
         if (focusedNode != null) {
-            layoutModel.magnifyNodeToggle(focusedNode.id);
+            const ephemeralNode = globalStore.get(layoutModel.ephemeralNode);
+            if (ephemeralNode?.id === focusedNode.id) {
+                layoutModel.addEphemeralNodeToLayout();
+            } else {
+                layoutModel.magnifyNodeToggle(focusedNode.id);
+            }
         }
         return true;
     });
@@ -633,6 +638,14 @@ function registerGlobalKeys() {
             true
         );
         return true;
+    });
+    globalKeyMap.set("F2", () => {
+        const tabModel = getActiveTabModel();
+        if (tabModel?.startRenameCallback != null) {
+            tabModel.startRenameCallback();
+            return true;
+        }
+        return false;
     });
     globalKeyMap.set("Cmd:g", () => {
         const bcm = getBlockComponentModel(getFocusedBlockInStaticTab());
